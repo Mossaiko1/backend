@@ -1,0 +1,358 @@
+BASE DE DATOS GMSF
+__________________________________________________
+1. TABLAS
+__________________________________________________
+CREATE TABLE usuarios (
+    id SERIAL PRIMARY KEY,
+    codigo VARCHAR(10) UNIQUE NOT NULL CHECK (codigo ~ '^U\d{3}$'),
+    nombre VARCHAR(100) NOT NULL CHECK (LENGTH(nombre) >= 3),
+    apellido VARCHAR(100) NOT NULL CHECK (LENGTH(apellido) >= 3),
+    correo VARCHAR(100) UNIQUE NOT NULL CHECK (correo ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[a-zA-Z]{2,}$'),
+    contrasena_hash VARCHAR(255) NOT NULL,
+    telefono VARCHAR(15) CHECK (telefono ~ '^\d{7,15}$'),
+    direccion TEXT,
+    genero CHAR(1) CHECK (genero IN ('M', 'F', 'O')),
+    tipo_documento VARCHAR(10) CHECK (tipo_documento IN ('CC', 'CE', 'TI', 'PP', 'DIE')),
+    numero_documento VARCHAR(20) UNIQUE NOT NULL,
+    fecha_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    asistencias_totales INT DEFAULT 0 CHECK (asistencias_totales >= 0),
+    fecha_nacimiento DATE NOT NULL CHECK (fecha_nacimiento <= (CURRENT_DATE - INTERVAL '15 years')),
+    estado BOOLEAN DEFAULT TRUE,
+    id_rol INT REFERENCES roles(id) ON DELETE SET NULL
+);
+CREATE TABLE roles (
+    id SERIAL PRIMARY KEY,
+    codigo VARCHAR(10) UNIQUE NOT NULL CHECK (codigo ~ '^R\d{3}$'),
+    nombre VARCHAR(50) UNIQUE NOT NULL,
+    descripcion TEXT,
+    estado BOOLEAN DEFAULT TRUE
+);
+CREATE TABLE usuario_rol (
+    id SERIAL PRIMARY KEY,
+    id_usuario INT REFERENCES usuarios(id) ON DELETE CASCADE,
+    id_rol INT REFERENCES roles(id) ON DELETE CASCADE,
+    fecha_inicio DATE NOT NULL,
+    fecha_fin DATE CHECK (fecha_fin > fecha_inicio),
+    UNIQUE (id_usuario, id_rol, fecha_inicio)
+);
+CREATE TABLE permisos (
+    id SERIAL PRIMARY KEY,
+    nombre VARCHAR(50) UNIQUE NOT NULL,
+    estado BOOLEAN DEFAULT TRUE
+);
+CREATE TABLE privilegios (
+    id SERIAL PRIMARY KEY,
+    nombre VARCHAR(50) NOT NULL,
+    id_permiso INT REFERENCES permisos(id) ON DELETE CASCADE,
+    UNIQUE (nombre, id_permiso)
+);
+CREATE TABLE rol_privilegio (
+    id SERIAL PRIMARY KEY,
+    id_rol INT REFERENCES roles(id) ON DELETE CASCADE,
+    id_permiso INT REFERENCES permisos(id) ON DELETE CASCADE,
+    id_privilegio INT REFERENCES privilegios(id) ON DELETE CASCADE,
+    UNIQUE (id_rol, id_permiso, id_privilegio)
+);
+
+CREATE TABLE personas (
+    id_persona SERIAL PRIMARY KEY,
+    id_usuario INT REFERENCES usuarios(id) ON DELETE CASCADE,
+    codigo VARCHAR(10) UNIQUE NOT NULL CHECK (codigo ~ '^P\d{3}$'),
+    id_titular INT REFERENCES personas(id_persona) ON DELETE SET NULL,
+    relacion VARCHAR(50),
+    fecha_registro DATE NOT NULL,
+    fecha_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    estado BOOLEAN DEFAULT TRUE
+);
+CREATE TABLE contactos_emergencia (
+    id SERIAL PRIMARY KEY,
+    id_persona INT REFERENCES personas(id_persona) ON DELETE CASCADE,
+    nombre_contacto VARCHAR(100) NOT NULL,
+    telefono_contacto VARCHAR(15) CHECK (telefono_contacto ~ '^\d{7,15}$'),
+    relacion_contacto VARCHAR(50),
+    es_mismo_beneficiario BOOLEAN DEFAULT FALSE,
+    fecha_registro DATE NOT NULL,
+    fecha_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE entrenadores (
+    id SERIAL PRIMARY KEY,
+    codigo VARCHAR(10) UNIQUE NOT NULL CHECK (codigo ~ '^E\d{3}$'),
+    id_usuario INT REFERENCES usuarios(id) ON DELETE CASCADE,
+    fecha_registro DATE NOT NULL,
+    especialidad VARCHAR(100) NOT NULL,
+    estado BOOLEAN DEFAULT TRUE
+);
+CREATE TABLE membresias (
+    id SERIAL PRIMARY KEY,
+    codigo VARCHAR(10) UNIQUE NOT NULL CHECK (codigo ~ '^M\d{3}$'),
+    nombre VARCHAR(100) UNIQUE NOT NULL,
+    descripcion TEXT,
+    dias_acceso INT CHECK (dias_acceso > 0),
+    vigencia_dias INT CHECK (vigencia_dias >= dias_acceso),
+    precio NUMERIC(10,2) CHECK (precio > 0),
+    fecha_creacion DATE NOT NULL,
+    estado BOOLEAN DEFAULT TRUE
+);
+CREATE TABLE uso_membresia (
+    id SERIAL PRIMARY KEY,
+    id_contrato INT REFERENCES contratos(id) ON DELETE CASCADE,
+    fecha_uso DATE NOT NULL
+);
+CREATE TABLE contratos (
+    id SERIAL PRIMARY KEY,
+    codigo VARCHAR(10) UNIQUE NOT NULL CHECK (codigo ~ '^C\d{4}$'),
+    id_persona INT REFERENCES personas(id_persona) ON DELETE CASCADE,
+    id_membresia INT REFERENCES membresias(id) ON DELETE CASCADE,
+    fecha_inicio DATE NOT NULL,
+    fecha_fin DATE NOT NULL CHECK (fecha_fin > fecha_inicio),
+    membresia_precio NUMERIC(10,2) CHECK (membresia_precio > 0),
+    estado VARCHAR(20) CHECK (estado IN ('Activo', 'Congelado', 'Vencido', 'Cancelado', 'Por vencer')),
+    fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    fecha_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    usuario_registro INT REFERENCES usuarios(id) ON DELETE SET NULL,
+    usuario_actualizacion INT REFERENCES usuarios(id) ON DELETE SET NULL
+);
+CREATE TABLE historial_contratos (
+    id SERIAL PRIMARY KEY,
+    id_contrato INT REFERENCES contratos(id) ON DELETE CASCADE,
+    estado_anterior VARCHAR(20),
+    estado_nuevo VARCHAR(20),
+    fecha_cambio TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    usuario_cambio INT REFERENCES usuarios(id) ON DELETE SET NULL,
+    motivo TEXT
+);
+__________________________________________________
+2. Triggers
+__________________________________________________
+1. Validar Fechas de Membresías
+Problema: Asegurar que la fecha_fin de un contrato no exceda la vigencia de la membresía asociada.
+Trigger:
+CREATE OR REPLACE FUNCTION validar_vigencia_membresia()
+RETURNS TRIGGER AS $$
+DECLARE
+    vigencia_dias INT;
+BEGIN
+    SELECT m.vigencia_dias INTO vigencia_dias
+    FROM membresias m
+    WHERE m.id = NEW.id_membresia;
+    IF (NEW.fecha_fin - NEW.fecha_inicio) > vigencia_dias THEN
+        RAISE EXCEPTION 'La vigencia de la membresía no cubre el período del contrato';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER tg_validar_vigencia
+BEFORE INSERT OR UPDATE ON contratos
+FOR EACH ROW EXECUTE FUNCTION validar_vigencia_membresia();
+2. Notificación de Membresías por Vencer
+Problema: Alertar automáticamente cuando una membresía está próxima a vencer.
+
+Trigger + Tabla de Notificaciones:
+-- Crear tabla para notificaciones
+CREATE TABLE notificaciones (
+    id SERIAL PRIMARY KEY,
+    id_usuario INT REFERENCES usuarios(id),
+    mensaje TEXT,
+    fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    leido BOOLEAN DEFAULT FALSE
+);
+
+-- Trigger para membresías próximas a vencer
+CREATE OR REPLACE FUNCTION notificar_vencimiento()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.fecha_fin <= CURRENT_DATE + INTERVAL '7 days' THEN
+        INSERT INTO notificaciones (id_usuario, mensaje)
+        VALUES (NEW.usuario_registro, 'La membresía ' || NEW.codigo || ' vencerá en 7 días');
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER tg_notificar_vencimiento
+AFTER INSERT OR UPDATE ON contratos
+FOR EACH ROW EXECUTE FUNCTION notificar_vencimiento();
+3. Actualizar Estados Automáticamente
+Problema: Cambiar el estado de contratos a "Vencido" cuando fecha_fin es menor a la fecha actual.
+Trigger + Función:
+CREATE OR REPLACE FUNCTION actualizar_estado_contratos()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE contratos
+    SET estado = 'Vencido'
+    WHERE fecha_fin < CURRENT_DATE
+      AND estado <> 'Vencido';
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+-- Ejecutar diariamente con pg_cron (si está instalado)
+SELECT cron.schedule('0 0 * * *', 'SELECT actualizar_estado_contratos()');
+Ejemplo de Trigger para Medición de Rendimiento:
+CREATE OR REPLACE FUNCTION actualizar_asistencias()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE usuarios
+    SET asistencias_totales = asistencias_totales + 1
+    WHERE id = (SELECT id_usuario FROM personas WHERE id_persona = NEW.id_cliente);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER tg_actualizar_asistencias
+AFTER INSERT ON uso_membresia
+FOR EACH ROW EXECUTE FUNCTION actualizar_asistencias();
+__________________________________________________
+3. Validaciones
+__________________________________________________
+-- En la tabla 'usuarios'
+ALTER TABLE usuarios 
+DROP CONSTRAINT IF EXISTS chk_telefono_formato_formato,  -- Si ya existe
+ADD CONSTRAINT chk_telefono_formato 
+CHECK (telefono ~ '^\+[0-9]{1,3}([\s\-()]*[0-9]){7,15}$');
+-- En la tabla 'contactos_emergencia'
+ALTER TABLE contactos_emergencia 
+DROP CONSTRAINT IF EXISTS chk_telefono_contacto_formato_formato,  -- Si ya existe
+ADD CONSTRAINT chk_telefono_contacto_formato 
+CHECK (telefono_contacto ~ '^\+[0-9]{1,3}([\s\-()]*[0-9]){7,15}$');
+1. Validar que un Titular no sea su propio Beneficiario
+Tabla: personas
+Problema: Evitar que un cliente se registre como su propio beneficiario.
+Validación:
+ALTER TABLE personas 
+ADD CONSTRAINT chk_titular_beneficiario 
+CHECK (id_titular <> id_persona);
+2. Restringir Contratos con Duración Mínima
+Tabla: contratos
+Problema: Evitar contratos con vigencia demasiado corta (ej: menos de 1 día).
+Validación:
+ALTER TABLE contratos 
+ADD CONSTRAINT chk_duracion_minima 
+CHECK (fecha_fin - fecha_inicio >= INTERVAL '1 dia');
+3. Validar Teléfonos con Formato Internacional
+Tablas: usuarios, contactos_emergencia
+Problema: Mejorar el formato de los números telefónicos (ej: incluir código de país).
+Validación:
+-- En usuarios
+ALTER TABLE usuarios 
+ADD CONSTRAINT chk_telefono_formato 
+CHECK (telefono ~ '^\+\d{1,3}\d{7,15}$');
+-- En contactos_emergencia
+ALTER TABLE contactos_emergencia 
+ADD CONSTRAINT chk_telefono_contacto_formato 
+CHECK (telefono_contacto ~ '^\+\d{1,3}\d{7,15}$');
+5. Evitar Solapamiento de Horarios en Programaciones (Eliminado)
+7. Validar Relación entre Beneficiario y Titular
+Tabla: personas
+Problema: Asegurar que el titular de un beneficiario exista y esté activo.
+Validación (con Trigger):
+CREATE OR REPLACE FUNCTION validar_titular_activo()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.id_titular IS NOT NULL THEN
+        IF NOT EXISTS (
+            SELECT 1 
+            FROM personas p
+            WHERE p.id_persona = NEW.id_titular
+              AND p.estado = TRUE
+        ) THEN
+            RAISE EXCEPTION 'El titular debe existir y estar activo';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER tg_validar_titular
+BEFORE INSERT OR UPDATE ON personas
+FOR EACH ROW EXECUTE FUNCTION validar_titular_activo();
+__________________________________________________
+4. Índices
+__________________________________________________
+1. Índices Básicos (Frecuentes en WHERE/JOIN)
+Tabla: usuarios
+-- Para autenticación y búsquedas por correo
+CREATE INDEX idx_usuarios_correo ON usuarios(correo);
+-- Para filtrar por estado (activos/inactivos)
+CREATE INDEX idx_usuarios_estado ON usuarios(estado);
+-- Para joins con roles
+CREATE INDEX idx_usuarios_rol ON usuarios(id_rol);
+Tabla: contratos
+-- Consultas de vencimiento
+CREATE INDEX idx_contratos_fecha_fin ON contratos(fecha_fin);
+-- Filtrar por estado (Activo/Cancelado)
+CREATE INDEX idx_contratos_estado ON contratos(estado);
+-- Joins con personas y membresias
+CREATE INDEX idx_contratos_persona ON contratos(id_persona);
+CREATE INDEX idx_contratos_membresia ON contratos(id_membresia);
+Tabla: uso_membresia
+-- Consultas por fecha
+CREATE INDEX idx_uso_membresia_fecha ON uso_membresia(fecha_uso);
+-- Joins con contratos
+CREATE INDEX idx_uso_membresia_contrato ON uso_membresia(id_contrato);
+Tabla: personas
+-- Relación con usuarios
+CREATE INDEX idx_personas_usuario ON personas(id_usuario);
+-- Para beneficiarios (titular)
+CREATE INDEX idx_personas_titular ON personas(id_titular);
+-- Filtrar por estado
+CREATE INDEX idx_personas_estado ON personas(estado);
+2. Índices Compuestos (Múltiples Columnas)
+Tabla: contratos
+-- Consultas de contratos activos y vigentes
+CREATE INDEX idx_contratos_vigentes 
+ON contratos(fecha_fin, estado)
+WHERE estado = 'Activo';
+Tabla: membresias
+-- Validar vigencia y días de acceso
+CREATE INDEX idx_membresias_vigencia 
+ON membresias(vigencia_dias, dias_acceso);
+Tabla: historial_contratos
+-- Auditoría de cambios recientes
+CREATE INDEX idx_historial_fecha_cambio 
+ON historial_contratos(fecha_cambio DESC);
+3. Índices Parciales (Filtrados)
+Tabla: usuarios
+-- Sólo usuarios activos (evita escanear inactivos)
+CREATE INDEX idx_usuarios_activos 
+ON usuarios(id)
+WHERE estado = TRUE;
+__________________________________________________
+5. Consultas
+__________________________________________________
+1. Listar Clientes con Membresías Activas y sus Beneficiarios
+Descripción: Muestra clientes con membresías activas y las personas vinculadas como beneficiarios.
+SELECT 
+    u.nombre AS cliente,
+    p_titular.codigo AS codigo_cliente,
+    m.nombre AS membresia,
+    p_beneficiario.nombre AS beneficiario,
+    p_beneficiario.codigo AS codigo_beneficiario
+FROM contratos c
+JOIN personas p_titular ON c.id_persona = p_titular.id_persona
+JOIN usuarios u ON p_titular.id_usuario = u.id
+JOIN membresias m ON c.id_membresia = m.id
+LEFT JOIN personas p_beneficiario ON p_titular.id_persona = p_beneficiario.id_titular
+WHERE c.estado = 'Activo';
+4. Contratos con Precio de Membresía por Encima del Promedio
+Descripción: Contratos cuyo precio supera el promedio de membresías vigentes.
+SELECT 
+    c.codigo,
+    u.nombre || ' ' || u.apellido AS cliente,
+    m.nombre AS membresia,
+    c.membresia_precio
+FROM contratos c
+JOIN personas p ON c.id_persona = p.id_persona
+JOIN usuarios u ON p.id_usuario = u.id
+JOIN membresias m ON c.id_membresia = m.id
+WHERE c.membresia_precio > (
+    SELECT AVG(membresia_precio)
+    FROM contratos
+    WHERE estado IN ('Activo', 'Congelado'));
+5. Usuarios sin Contacto de Emergencia Registrado
+Descripción: Clientes que no han registrado ningún contacto de emergencia.
+SELECT 
+    u.nombre,
+    u.apellido,
+    p.codigo AS codigo_cliente
+FROM personas p
+JOIN usuarios u ON p.id_usuario = u.id
+LEFT JOIN contactos_emergencia ce ON p.id_persona = ce.id_persona
+WHERE ce.id IS NULL
+  AND p.estado = TRUE;
